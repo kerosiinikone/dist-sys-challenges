@@ -8,7 +8,7 @@ test-unique-ids:
 
 test-broadcast:
 	cd broadcast && go build -o ../bin/broadcast .
-	bash ./maelstrom/maelstrom test -w broadcast --bin ./bin/broadcast --node-count 1 --time-limit 20 --rate 10
+	bash ./maelstrom/maelstrom test -w broadcast --bin ./bin/broadcast --node-count 5 --time-limit 20 --rate 10
 
 serve:
 	bash ./maelstrom/maelstrom serve

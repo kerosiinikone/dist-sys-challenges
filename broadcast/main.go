@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -9,11 +10,12 @@ import (
 
 type Body struct {
 	// Provided by the RPC:
-	// Reply uint        `json:":in_reply_to,omitempty"`
-	Typ  string      `json:"type"`
-	ID   uint        `json:"msg_id"`
-	Msg  interface{} `json:"message,omitempty"`
-	Msgs interface{} `json:"messages,omitempty"`
+	// Reply    uint                `json:":in_reply_to,omitempty"`
+	Typ      string              `json:"type"`
+	ID       uint                `json:"msg_id"`
+	Msg      interface{}         `json:"message,omitempty"`
+	Msgs     interface{}         `json:"messages,omitempty"`
+	Topology map[string][]string `json:"topology,omitempty"`
 }
 
 func main() {
@@ -22,6 +24,7 @@ func main() {
 		counter uint = 0
 		n            = maelstrom.NewNode()
 		hashset      = map[float64]bool{}
+		neighb       = make([]string, 0)
 	)
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body Body
@@ -33,6 +36,32 @@ func main() {
 		counter = counter + 1
 		currentID := counter
 		mut.Unlock()
+
+		mut.RLock()
+		for _, r := range neighb {
+			if r == msg.Src {
+				continue
+			}
+			if err := n.RPC(r, Body{
+				Typ: "broadcast",
+				ID:  currentID,
+				Msg: body.Msg,
+			}, func(msg maelstrom.Message) error {
+				var body Body
+				if err := json.Unmarshal(msg.Body, &body); err != nil {
+					return err
+				}
+				if body.Typ != "broadcast_ok" {
+					return fmt.Errorf("wrong type")
+				}
+				return nil
+			}); err != nil {
+				// Not partition tolerant but works for this simple case
+				panic(err)
+			}
+
+		}
+		mut.RUnlock()
 
 		return n.Reply(msg, Body{
 			ID:  currentID,
@@ -68,8 +97,14 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		// For now
+
 		mut.Lock()
+		if _, ok := body.Topology[msg.Dest]; !ok {
+			panic("no neighbours")
+		}
+		// Figure out your neighbours!
+		neighb = body.Topology[msg.Dest]
+
 		counter = counter + 1
 		currentID := counter
 		mut.Unlock()
