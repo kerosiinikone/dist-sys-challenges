@@ -4,13 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type Body struct {
-	// Provided by the RPC:
-	// Reply    uint                `json:":in_reply_to,omitempty"`
 	Typ      string              `json:"type"`
 	ID       uint                `json:"msg_id"`
 	Msg      interface{}         `json:"message,omitempty"`
@@ -26,6 +25,7 @@ func main() {
 		hashset      = map[float64]bool{}
 		neighb       = make([]string, 0)
 	)
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body Body
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -56,8 +56,7 @@ func main() {
 				}
 				return nil
 			}); err != nil {
-				// Not partition tolerant but works for this simple case
-				panic(err)
+				continue
 			}
 
 		}
@@ -102,7 +101,7 @@ func main() {
 		if _, ok := body.Topology[msg.Dest]; !ok {
 			panic("no neighbours")
 		}
-		// Figure out your neighbours!
+		// Assumes all new and old neighbours in the message
 		neighb = body.Topology[msg.Dest]
 
 		counter = counter + 1
@@ -114,6 +113,46 @@ func main() {
 			Typ: "topology_ok",
 		})
 	})
+
+	n.Handle("flush", func(msg maelstrom.Message) error {
+		var (
+			body Body
+		)
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		mut.Lock()
+		for _, msg := range body.Msg.([]interface{}) {
+			hashset[msg.(float64)] = true
+		}
+		mut.Unlock()
+
+		return nil
+	})
+
+	go func() {
+		tckr := time.NewTicker(500 * time.Millisecond)
+		defer tckr.Stop()
+
+		for range tckr.C {
+			mut.RLock()
+			output := make([]float64, 0, len(hashset))
+			for k := range hashset {
+				output = append(output, k)
+			}
+			mut.RUnlock()
+			if len(output) == 0 {
+				continue
+			}
+			for _, ne := range neighb {
+				n.Send(ne, Body{
+					Typ: "flush",
+					Msg: output,
+				})
+			}
+		}
+	}()
+
 	if err := n.Run(); err != nil {
 		panic(err)
 	}
