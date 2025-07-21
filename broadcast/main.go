@@ -4,172 +4,231 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
-	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type Body struct {
-	Typ      string              `json:"type"`
-	ID       uint                `json:"msg_id"`
-	Msg      interface{}         `json:"message,omitempty"`
-	Msgs     interface{}         `json:"messages,omitempty"`
+// const SYNC_LATENCY = 45
+
+type workerMsg struct {
+	msg float64
+	src string
+}
+
+type MsgBody struct {
+	Typ  string      `json:"type"`
+	Msg  interface{} `json:"message,omitempty"`
+	Msgs interface{} `json:"messages,omitempty"`
+}
+
+type TopoBody struct {
 	Topology map[string][]string `json:"topology,omitempty"`
 }
 
-func main() {
-	// TODO: Main struct to hold the "main lock" mutex -> not globally
-	var (
-		// For now
-		// counter uint = 0
-		mut sync.RWMutex
+type Hashset struct {
+	hm      sync.RWMutex
+	hashset map[float64]bool
+}
 
-		n       = maelstrom.NewNode()
-		hashset = map[float64]bool{}
-		nlog    = map[float64]bool{}
-		neighb  = make([]string, 0)
-	)
+type Neighb struct {
+	nm     sync.RWMutex
+	neighb []string
+}
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var body Body
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
+type NodeMut struct {
+	n   *maelstrom.Node
+	jch chan workerMsg
+	Hashset
+	Neighb
+	// nlog    map[float64]bool
+}
 
-		mut.Lock()
-		hashset[body.Msg.(float64)] = true
-		nlog[body.Msg.(float64)] = true
-		mut.Unlock()
+func (n *NodeMut) broadcast(msg maelstrom.Message) error {
+	var body MsgBody
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 
-		// counter = counter + 1
-		// currentID := counter
+	if body.Typ == "broadcast_ok" {
+		return nil
+	}
 
-		// for _, r := range templist {
-		// 	if r == msg.Src {
-		// 		continue
-		// 	}
-		// 	if err := n.RPC(r, Body{
-		// 		Typ: "broadcast",
-		// 		ID:  body.ID + 1,
-		// 		Msg: body.Msg,
-		// 	}, func(msg maelstrom.Message) error {
-		// 		var body Body
-		// 		if err := json.Unmarshal(msg.Body, &body); err != nil {
-		// 			return err
-		// 		}
-		// 		if body.Typ != "broadcast_ok" {
-		// 			return fmt.Errorf("wrong type")
-		// 		}
-		// 		return nil
-		// 	}); err != nil {
-		// 		continue
-		// 	}
-		// }
-
-		return n.Reply(msg, Body{
-			ID:  body.ID + 1,
+	n.hm.Lock()
+	if _, ok := n.hashset[body.Msg.(float64)]; ok {
+		// Seen -> skip
+		n.hm.Unlock()
+		return n.n.Reply(msg, MsgBody{
 			Typ: "broadcast_ok",
 		})
+	}
+	n.hashset[body.Msg.(float64)] = true
+	n.hm.Unlock()
+
+	n.jch <- workerMsg{
+		msg: body.Msg.(float64),
+		src: msg.Src,
+	}
+
+	// n.nlog[body.Msg.(float64)] = true
+
+	// counter = counter + 1
+	// currentID := counter
+
+	return n.n.Reply(msg, MsgBody{
+		Typ: "broadcast_ok",
 	})
-	n.Handle("read", func(msg maelstrom.Message) error {
-		var body Body
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
+}
 
-		mut.RLock()
-		defer mut.RUnlock()
+func (n *NodeMut) read(msg maelstrom.Message) error {
+	var body MsgBody
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 
-		output := make([]float64, 0, len(hashset))
-		for k := range hashset {
-			output = append(output, k)
-		}
+	n.hm.RLock()
+	defer n.hm.RUnlock()
+	output := make([]float64, 0, len(n.hashset))
+	for k := range n.hashset {
+		output = append(output, k)
+	}
 
-		// mut.Lock()
-		// counter = counter + 1
-		// currentID := counter
-		// mut.Unlock()
+	// mut.Lock()
+	// counter = counter + 1
+	// currentID := counter
+	// mut.Unlock()
 
-		return n.Reply(msg, Body{
-			ID:   body.ID + 1,
-			Typ:  "read_ok",
-			Msgs: output,
-		})
+	return n.n.Reply(msg, MsgBody{
+		Typ:  "read_ok",
+		Msgs: output,
 	})
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body Body
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
+}
 
-		if _, ok := body.Topology[msg.Dest]; !ok {
-			panic("no neighbours")
-		}
-		// Assumes all new and old neighbours in the message
-		mut.Lock()
-		neighb = body.Topology[msg.Dest]
-		mut.Unlock()
+func (n *NodeMut) topology(msg maelstrom.Message) error {
+	var body TopoBody
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	// if _, ok := body.Topology[msg.Dest]; !ok {
+	// 	panic("no neighbours")
+	// }
 
-		// mut.Lock()
-		// counter = counter + 1
-		// currentID := counter
-		// mut.Unlock()
+	// Assumes all new and old neighbours in the message
+	n.nm.Lock()
+	defer n.nm.Unlock()
+	n.neighb = body.Topology[msg.Dest]
 
-		return n.Reply(msg, Body{
-			ID:  body.ID + 1,
-			Typ: "topology_ok",
-		})
+	// mut.Lock()
+	// counter = counter + 1
+	// currentID := counter
+	// mut.Unlock()
+
+	return n.n.Reply(msg, MsgBody{
+		Typ: "topology_ok",
 	})
+}
 
-	n.Handle("flush", func(msg maelstrom.Message) error {
-		var (
-			body Body
-		)
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
+// func (n *NodeMut) _flush(msg maelstrom.Message) error {
+// 	var (
+// 		body Body
+// 	)
+// 	if err := json.Unmarshal(msg.Body, &body); err != nil {
+// 		return err
+// 	}
+// 	n.mut.Lock()
+// 	defer n.mut.Unlock()
+// 	for _, msg := range body.Msg.([]interface{}) {
+// 		n.hashset[msg.(float64)] = true
+// 		// n.nlog[msg.(float64)] = true
+// 	}
+
+// 	return nil
+// }
+
+// func (n *NodeMut) _syncLoop() {
+// 	tckr := time.NewTicker(SYNC_LATENCY * time.Millisecond)
+// 	defer tckr.Stop()
+
+// 	for range tckr.C {
+// 		n.mut.Lock()
+// 		if len(n.nlog) == 0 {
+// 			n.mut.Unlock()
+// 			continue
+// 		}
+// 		output := make([]float64, 0, len(n.nlog))
+// 		for l := range n.nlog {
+// 			output = append(output, l)
+// 		}
+// 		n.nlog = make(map[float64]bool)
+// 		temp := make([]string, len(n.neighb))
+// 		copy(temp, n.neighb)
+// 		n.mut.Unlock()
+
+// 		for _, ne := range temp {
+// 			if err := n.n.Send(ne, Body{
+// 				Typ: "flush",
+// 				Msg: output,
+// 			}); err != nil {
+// 				continue
+// 			}
+// 		}
+// 	}
+// }
+
+func (n *NodeMut) worker() {
+	for msg := range n.jch {
+		n.nm.RLock()
+		temp := make([]string, len(n.neighb))
+		copy(temp, n.neighb)
+		n.nm.RUnlock()
+
+		b := MsgBody{
+			Typ: "broadcast",
+			Msg: msg.msg,
 		}
-		for _, msg := range body.Msg.([]interface{}) {
-			mut.Lock()
-			hashset[msg.(float64)] = true
-			nlog[msg.(float64)] = true
-			mut.Unlock()
-		}
 
-		return nil
-	})
-
-	go func() {
-		tckr := time.NewTicker(200 * time.Millisecond)
-		defer tckr.Stop()
-
-		for range tckr.C {
-			mut.Lock()
-			if len(nlog) == 0 {
-				mut.Unlock()
+		for _, ne := range temp {
+			if ne == msg.src {
 				continue
 			}
-			output := make([]float64, 0, len(nlog))
-			for l := range nlog {
-				output = append(output, l)
+			if err := n.n.Send(ne, b); err != nil {
+				continue
 			}
-			nlog = make(map[float64]bool)
-			mut.Unlock()
-
-			// TODO: The temp copy trick to release the lock?
-			mut.RLock()
-			for _, ne := range neighb {
-				if err := n.Send(ne, Body{
-					Typ: "flush",
-					Msg: output,
-				}); err != nil {
-					continue
-				}
-			}
-			mut.RUnlock()
 		}
-	}()
+	}
+}
 
-	if err := n.Run(); err != nil {
+func main() {
+	var (
+		// For now
+		// counter float64 = 0
+		node = NodeMut{
+			// nlog:    map[float64]bool{},
+			n:   maelstrom.NewNode(),
+			jch: make(chan workerMsg), // Buffer amount?
+			Hashset: Hashset{
+				hashset: map[float64]bool{},
+				hm:      sync.RWMutex{},
+			},
+			Neighb: Neighb{
+				neighb: make([]string, 0),
+				nm:     sync.RWMutex{},
+			},
+		}
+	)
+
+	node.n.Handle("broadcast", node.broadcast)
+	node.n.Handle("broadcast_ok", node.broadcast)
+	node.n.Handle("read", node.read)
+	node.n.Handle("topology", node.topology)
+	// node.n.Handle("flush", node.flush)
+
+	// go node.syncLoop()
+
+	for i := 0; i < 5; i++ {
+		go node.worker()
+	}
+
+	if err := node.n.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
