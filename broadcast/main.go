@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"runtime"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -16,9 +17,14 @@ type workerMsg struct {
 }
 
 type MsgBody struct {
-	Typ  string      `json:"type"`
-	Msg  interface{} `json:"message,omitempty"`
-	Msgs interface{} `json:"messages,omitempty"`
+	Typ string  `json:"type"`
+	Msg float64 `json:"message,omitempty"`
+}
+
+type ReadBody struct {
+	ID   int       `json:"msg_id"`
+	Typ  string    `json:"type"`
+	Msgs []float64 `json:"messages"`
 }
 
 type TopoBody struct {
@@ -37,10 +43,20 @@ type Neighb struct {
 
 type NodeMut struct {
 	n   *maelstrom.Node
-	jch chan workerMsg
+	jch chan *workerMsg
 	Hashset
 	Neighb
 	// nlog    map[float64]bool
+}
+
+var pool = sync.Pool{
+	New: func() any {
+		return new(workerMsg)
+	},
+}
+
+func (n *NodeMut) broadcastOk(msg maelstrom.Message) error {
+	return nil
 }
 
 func (n *NodeMut) broadcast(msg maelstrom.Message) error {
@@ -48,39 +64,34 @@ func (n *NodeMut) broadcast(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
-
-	if body.Typ == "broadcast_ok" {
-		return nil
-	}
-
 	n.hm.Lock()
-	if _, ok := n.hashset[body.Msg.(float64)]; ok {
+	if _, ok := n.hashset[body.Msg]; ok {
 		// Seen -> skip
 		n.hm.Unlock()
-		return n.n.Reply(msg, MsgBody{
-			Typ: "broadcast_ok",
+		return n.n.Reply(msg, map[string]string{
+			"type": "broadcast_ok",
 		})
 	}
-	n.hashset[body.Msg.(float64)] = true
+	n.hashset[body.Msg] = true
 	n.hm.Unlock()
 
-	n.jch <- workerMsg{
-		msg: body.Msg.(float64),
-		src: msg.Src,
-	}
+	job := pool.Get().(*workerMsg)
+	job.msg = body.Msg
+	job.src = msg.Src
+	n.jch <- job
 
 	// n.nlog[body.Msg.(float64)] = true
 
 	// counter = counter + 1
 	// currentID := counter
 
-	return n.n.Reply(msg, MsgBody{
-		Typ: "broadcast_ok",
+	return n.n.Reply(msg, map[string]string{
+		"type": "broadcast_ok",
 	})
 }
 
 func (n *NodeMut) read(msg maelstrom.Message) error {
-	var body MsgBody
+	var body ReadBody
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
@@ -97,9 +108,9 @@ func (n *NodeMut) read(msg maelstrom.Message) error {
 	// currentID := counter
 	// mut.Unlock()
 
-	return n.n.Reply(msg, MsgBody{
-		Typ:  "read_ok",
-		Msgs: output,
+	return n.n.Reply(msg, map[string]any{
+		"type":     "read_ok",
+		"messages": output,
 	})
 }
 
@@ -122,8 +133,8 @@ func (n *NodeMut) topology(msg maelstrom.Message) error {
 	// currentID := counter
 	// mut.Unlock()
 
-	return n.n.Reply(msg, MsgBody{
-		Typ: "topology_ok",
+	return n.n.Reply(msg, map[string]string{
+		"type": "topology_ok",
 	})
 }
 
@@ -175,16 +186,15 @@ func (n *NodeMut) topology(msg maelstrom.Message) error {
 // }
 
 func (n *NodeMut) worker() {
+	b := MsgBody{
+		Typ: "broadcast",
+	}
 	for msg := range n.jch {
 		n.nm.RLock()
 		temp := make([]string, len(n.neighb))
 		copy(temp, n.neighb)
 		n.nm.RUnlock()
-
-		b := MsgBody{
-			Typ: "broadcast",
-			Msg: msg.msg,
-		}
+		b.Msg = msg.msg
 
 		for _, ne := range temp {
 			if ne == msg.src {
@@ -194,6 +204,7 @@ func (n *NodeMut) worker() {
 				continue
 			}
 		}
+		pool.Put(msg)
 	}
 }
 
@@ -204,7 +215,7 @@ func main() {
 		node = NodeMut{
 			// nlog:    map[float64]bool{},
 			n:   maelstrom.NewNode(),
-			jch: make(chan workerMsg), // Buffer amount?
+			jch: make(chan *workerMsg, 256), // Buffer amount?
 			Hashset: Hashset{
 				hashset: map[float64]bool{},
 				hm:      sync.RWMutex{},
@@ -217,14 +228,15 @@ func main() {
 	)
 
 	node.n.Handle("broadcast", node.broadcast)
-	node.n.Handle("broadcast_ok", node.broadcast)
+	node.n.Handle("broadcast_ok", node.broadcastOk)
 	node.n.Handle("read", node.read)
 	node.n.Handle("topology", node.topology)
 	// node.n.Handle("flush", node.flush)
 
 	// go node.syncLoop()
 
-	for i := 0; i < 5; i++ {
+	numWorkers := runtime.NumCPU()
+	for i := 0; i < numWorkers; i++ {
 		go node.worker()
 	}
 
