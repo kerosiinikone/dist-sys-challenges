@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"log"
 	"runtime"
+	"sort"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
-
-// const SYNC_LATENCY = 45
 
 type workerMsg struct {
 	msg float64
@@ -36,17 +35,23 @@ type Hashset struct {
 	hashset map[float64]bool
 }
 
-type Neighb struct {
-	nm     sync.RWMutex
-	neighb []string
+// type Neighb struct {
+// 	nm     sync.RWMutex
+// 	neighb []string
+// }
+
+type SpanningTree struct {
+	stm      sync.RWMutex
+	parent   string
+	children []string
 }
 
 type NodeMut struct {
 	n   *maelstrom.Node
 	jch chan *workerMsg
 	Hashset
-	Neighb
-	// nlog    map[float64]bool
+	SpanningTree
+	// Neighb
 }
 
 var pool = sync.Pool{
@@ -55,8 +60,58 @@ var pool = sync.Pool{
 	},
 }
 
-func (n *NodeMut) broadcastOk(msg maelstrom.Message) error {
-	return nil
+func (n *NodeMut) createTopology(topology map[string][]string) {
+	n.stm.Lock()
+	defer n.stm.Unlock()
+
+	if n.parent != "" {
+		return
+	}
+	if len(n.children) > 0 {
+		return
+	}
+
+	all := make([]string, 0)
+	for node := range topology {
+		all = append(all, node)
+	}
+	sort.Strings(all)
+	root := all[0]
+
+	n.parent = "root"
+	if n.n.ID() == root {
+		n.parent = ""
+	}
+
+	q := []string{root}
+	visited := map[string]bool{root: true}
+	parents := map[string]string{n.n.ID(): ""}
+
+	for len(q) > 0 {
+		curr := q[0]
+		q = q[1:]
+
+		for _, neighbor := range topology[curr] {
+			if !visited[neighbor] {
+				visited[neighbor] = true
+				parents[neighbor] = curr
+				q = append(q, neighbor)
+			}
+		}
+	}
+
+	ownParent := parents[n.n.ID()]
+	if ownParent != "" {
+		n.parent = ownParent
+	}
+
+	ownChildren := make([]string, 0)
+	for node, parent := range parents {
+		if parent == n.n.ID() {
+			ownChildren = append(ownChildren, node)
+		}
+	}
+	n.children = ownChildren
 }
 
 func (n *NodeMut) broadcast(msg maelstrom.Message) error {
@@ -64,14 +119,8 @@ func (n *NodeMut) broadcast(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
+
 	n.hm.Lock()
-	if _, ok := n.hashset[body.Msg]; ok {
-		// Seen -> skip
-		n.hm.Unlock()
-		return n.n.Reply(msg, map[string]string{
-			"type": "broadcast_ok",
-		})
-	}
 	n.hashset[body.Msg] = true
 	n.hm.Unlock()
 
@@ -79,11 +128,6 @@ func (n *NodeMut) broadcast(msg maelstrom.Message) error {
 	job.msg = body.Msg
 	job.src = msg.Src
 	n.jch <- job
-
-	// n.nlog[body.Msg.(float64)] = true
-
-	// counter = counter + 1
-	// currentID := counter
 
 	return n.n.Reply(msg, map[string]string{
 		"type": "broadcast_ok",
@@ -95,19 +139,12 @@ func (n *NodeMut) read(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
-
 	n.hm.RLock()
 	defer n.hm.RUnlock()
 	output := make([]float64, 0, len(n.hashset))
 	for k := range n.hashset {
 		output = append(output, k)
 	}
-
-	// mut.Lock()
-	// counter = counter + 1
-	// currentID := counter
-	// mut.Unlock()
-
 	return n.n.Reply(msg, map[string]any{
 		"type":     "read_ok",
 		"messages": output,
@@ -119,88 +156,59 @@ func (n *NodeMut) topology(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
-	// if _, ok := body.Topology[msg.Dest]; !ok {
-	// 	panic("no neighbours")
-	// }
-
 	// Assumes all new and old neighbours in the message
-	n.nm.Lock()
-	defer n.nm.Unlock()
-	n.neighb = body.Topology[msg.Dest]
-
-	// mut.Lock()
-	// counter = counter + 1
-	// currentID := counter
-	// mut.Unlock()
+	// n.nm.Lock()
+	// Construct a more efficient topology map ->
+	// Remove the need for overlapping neighbours (duplicate messages)
+	// Spanning trees
+	// defer n.nm.Unlock()
+	n.createTopology(body.Topology)
 
 	return n.n.Reply(msg, map[string]string{
 		"type": "topology_ok",
 	})
 }
 
-// func (n *NodeMut) _flush(msg maelstrom.Message) error {
-// 	var (
-// 		body Body
-// 	)
-// 	if err := json.Unmarshal(msg.Body, &body); err != nil {
-// 		return err
-// 	}
-// 	n.mut.Lock()
-// 	defer n.mut.Unlock()
-// 	for _, msg := range body.Msg.([]interface{}) {
-// 		n.hashset[msg.(float64)] = true
-// 		// n.nlog[msg.(float64)] = true
-// 	}
+func (n *NodeMut) flush(msg maelstrom.Message) error {
+	var (
+		body MsgBody
+	)
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	n.hm.Lock()
+	if _, ok := n.hashset[body.Msg]; ok {
+		n.hm.Unlock()
+		return nil
+	}
+	n.hashset[body.Msg] = true
+	n.hm.Unlock()
 
-// 	return nil
-// }
+	job := pool.Get().(*workerMsg)
+	job.msg = body.Msg
+	job.src = msg.Src
+	n.jch <- job
 
-// func (n *NodeMut) _syncLoop() {
-// 	tckr := time.NewTicker(SYNC_LATENCY * time.Millisecond)
-// 	defer tckr.Stop()
-
-// 	for range tckr.C {
-// 		n.mut.Lock()
-// 		if len(n.nlog) == 0 {
-// 			n.mut.Unlock()
-// 			continue
-// 		}
-// 		output := make([]float64, 0, len(n.nlog))
-// 		for l := range n.nlog {
-// 			output = append(output, l)
-// 		}
-// 		n.nlog = make(map[float64]bool)
-// 		temp := make([]string, len(n.neighb))
-// 		copy(temp, n.neighb)
-// 		n.mut.Unlock()
-
-// 		for _, ne := range temp {
-// 			if err := n.n.Send(ne, Body{
-// 				Typ: "flush",
-// 				Msg: output,
-// 			}); err != nil {
-// 				continue
-// 			}
-// 		}
-// 	}
-// }
+	return nil
+}
 
 func (n *NodeMut) worker() {
 	b := MsgBody{
-		Typ: "broadcast",
+		Typ: "flush",
 	}
 	for msg := range n.jch {
-		n.nm.RLock()
-		temp := make([]string, len(n.neighb))
-		copy(temp, n.neighb)
-		n.nm.RUnlock()
+		n.stm.RLock()
+		temp := make([]string, len(n.children))
+		copy(temp, n.children)
+		n.stm.RUnlock()
 		b.Msg = msg.msg
 
 		for _, ne := range temp {
-			if ne == msg.src {
-				continue
-			}
+			// if ne == msg.src {
+			// 	continue
+			// }
 			if err := n.n.Send(ne, b); err != nil {
+				// Retry -> fault-tolerance?
 				continue
 			}
 		}
@@ -210,32 +218,26 @@ func (n *NodeMut) worker() {
 
 func main() {
 	var (
-		// For now
-		// counter float64 = 0
 		node = NodeMut{
-			// nlog:    map[float64]bool{},
 			n:   maelstrom.NewNode(),
 			jch: make(chan *workerMsg, 256), // Buffer amount?
 			Hashset: Hashset{
 				hashset: map[float64]bool{},
 				hm:      sync.RWMutex{},
 			},
-			Neighb: Neighb{
-				neighb: make([]string, 0),
-				nm:     sync.RWMutex{},
+			SpanningTree: SpanningTree{
+				stm:      sync.RWMutex{},
+				children: make([]string, 0),
 			},
 		}
 	)
 
 	node.n.Handle("broadcast", node.broadcast)
-	node.n.Handle("broadcast_ok", node.broadcastOk)
+	node.n.Handle("flush", node.flush)
 	node.n.Handle("read", node.read)
 	node.n.Handle("topology", node.topology)
-	// node.n.Handle("flush", node.flush)
 
-	// go node.syncLoop()
-
-	numWorkers := runtime.NumCPU()
+	numWorkers := 2 * runtime.NumCPU()
 	for i := 0; i < numWorkers; i++ {
 		go node.worker()
 	}
